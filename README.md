@@ -4,7 +4,7 @@ RouteMon is a python daemon that runs on Arista EOS to monitor route changes and
 
 ## Installation
 
-1. Download latest release from Release page
+1. Download the [latest release](https://github.com/nathanmusser/RouteMon/releases/latest) from Releases page
 2. Install swix file
     #### Manually
     1. ```copy scp:user@10.1.2.3/home/user/RouteMon-x.x-x.noarch.swix extension:```
