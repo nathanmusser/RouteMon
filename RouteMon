@@ -1,0 +1,279 @@
+#!/usr/bin/env python2
+
+import EapiClientLib
+import eossdk
+import json
+import sys
+import syslog
+from time import time
+
+
+# File with a list of commands to run and put in the support bundle
+# The 2 variables available are {target_vrf} and {target_route} which
+# will be substituted as commands are ran
+SUPPORT_BUNDLE_CMD_FILE_PATH = '/mnt/flash/RouteMon.cmd'
+
+# Support bundle file path - should not need to change
+SUPPORT_BUNDLE_FILE_PATH = '/mnt/flash/'
+
+# Default vrf to monitor if none is specified - should not need to change
+# Use daemon options to specify vrf to target
+DEFAULT_TARGET_VRF = 'default'
+
+# Default output format for support bundle
+# options are text or json
+# can be configured in the daemon using: option support-bundle-format value <value>
+DEFAULT_SUPPORT_BUNDLE_FORMAT = 'text'
+
+# Simple class to represent the current state of a given route
+# it does rely on eossdk datatypes its vias
+# we also mirror the datatypes from eossdk my making the attributes private and
+# using getter methods as well as a to_string method. Once set the values can't be
+# publically changed.
+class RouteState():
+    def __init__(self, preference, metric, route_type, route_via):
+        self.__preference = preference
+        self.__metric = metric
+        self.__route_type = route_type
+        self.__via = route_via
+
+    def to_string(self):
+        via_string = ""
+        for via in self.__via:
+            via_string = "%s, {'hop': %s, 'intf': %s}" % (via_string, via['hop'].to_string(), via['intf'].to_string())
+        return "RouteState(preference=%s, metric=%s, route_type=%s, via=[%s])" % (self.__preference,
+                                                                                  self.__metric,
+                                                                                  self.route_type,
+                                                                                  via_string[2:])
+
+    def preference(self):
+        return self.__preference
+
+    def metric(self):
+        return self.__metric
+
+    def route_type(self):
+        return self.__route_type
+
+    def via(self):
+        return self.__via
+
+    def __eq__(self, other):
+        if isinstance(other, RouteState):
+            if self.__preference == other.preference() and self.__metric == other.metric() and self.__route_type == other.__route_type and self.__via == other.via():
+                return True
+        return False
+
+    def __ne__(self, other):
+        return not self == other
+
+
+class RouteMonAgent(eossdk.AgentHandler, eossdk.FibHandler):
+    def __init__(self, sdk_):
+        # Get SDK managers
+        self.agent_mgr = sdk_.get_agent_mgr()
+        self.fib_mgr = sdk_.get_fib_mgr(eossdk.MODE_TYPE_READ_NOTIFYING)
+        # Initialize managers and get tracer
+        eossdk.AgentHandler.__init__(self, self.agent_mgr)
+        eossdk.FibHandler.__init__(self, self.fib_mgr)
+        self.tracer = eossdk.Tracer("RouteMonAgent")
+        # Get a unique id for this instance of agent so we can make sure we write to a unique file
+        self.agent_name = sdk_.name()
+        self.agent_id = self.agent_mgr.id(self.agent_name)
+        # Setup our eapi client
+        # We could use the eossdk eapi_mgr
+        # Ex: self.eapi_mgr = sdk_.get_eapi_mgr()
+        # but it only supports output in json and we want the option of standard
+        # CLI pretty print
+        self.eapi_client = EapiClientLib.EapiClient(disableAaa=True, privLevel=15)
+        # Init our target_route and target_vrf to None
+        self.target_route = None
+        self.target_vrf = None
+        # Setup the support bundle output format
+        self.support_bundle_format = DEFAULT_SUPPORT_BUNDLE_FORMAT
+        # We have not been initialized
+        self.initialized = False
+        # Get our support bundle command list
+        # Edit the file referenced in SUPPORT_BUNDLE_CMD_FILE_PATH to edit these commands
+        self.support_bundle_cmds = list()
+        support_bundle_cmd_file = open(SUPPORT_BUNDLE_CMD_FILE_PATH,'r')
+        for line in support_bundle_cmd_file:
+            self.support_bundle_cmds.append(line.strip())
+        support_bundle_cmd_file.close()
+        self.tracer.trace0("Route Monitor Activated for %s on %s vrf" % (self.target_route, self.target_vrf))
+        self.logger(6,"INIT","Starting Route Monitor Agent")
+
+    # Writes formatted messages to syslog
+    def logger(self, severity, mnemonic, message):
+        syslog.openlog("RouteMonAgent", facility=syslog.LOG_LOCAL4)
+        syslog.syslog("%%ROUTEMON-%s-%s-%s: %s" % (self.agent_name, severity, mnemonic, message))
+        syslog.closelog()
+
+    # This function override is called when eossdk initializes our class
+    def on_initialized(self):
+        # Process configured daemon options
+        for option_name in self.agent_mgr.agent_option_iter():
+            option_value = self.agent_mgr.agent_option(option_name)
+            self.on_agent_option(option_name.lower(), option_value)
+        self.on_config_change()
+        response = self.eapi_client.runCmds(1,['enable','show hostname'])['result'][1]
+        self.hostname = response['hostname']
+        self.fqdn = response['fqdn']
+        self.tracer.trace0("Route Monitor Agent initialized")
+        self.initialized = True
+
+    # When the config has changed, either on-startup, or an option has been changed, we need to handle it
+    def on_config_change(self):
+        self.logger(6,"CONFIG_INIT","Config options changed or set")
+        if self.target_route:
+            if not self.target_vrf:
+                self.logger(4,"CONFIG_WARN","No vrf configured to monitor. Will monitor %s vrf. Use \"option vrf value <vrf_name>\" to set a vrf to monitor" % DEFAULT_TARGET_VRF)
+                self.target_vrf = DEFAULT_TARGET_VRF
+            # Fib_mgr can only monitor 1 vrf as far as I'm aware
+            # here we tell it which vrf to monitor
+            self.logger(6,"CONFIG_INIT","Monitoring %s on %s vrf" % (self.target_route, self.target_vrf))
+            self.fib_mgr.register_vrf(self.target_vrf, True)
+            # We go ahead and collect a current support bundle for output in the future
+            self.support_bundle_last_known_state = self.get_support_bundle_state()
+            self.logger(6,"CONFIG_INIT","Config initialized")
+        else:
+            self.logger(3,"CONFIG_ERROR","No route configured to monitor. Use \"option route value <subnet/mask>\" to set a route to monitor")
+            self.logger(6,"INIT","Exiting...")
+            self.agent_mgr.exit()
+
+    # This method override is called whenever an option is set or unset
+    def on_agent_option(self, option_name, option_value):
+        self.logger(6,"CONFIG","Option configured: %s = %s" % (option_name, option_value))
+        if option_name == "vrf":
+            if option_value:
+                self.target_vrf = option_value
+            else:
+                self.logger(4,"CONFIG_WARN","Monitoring for vrf %s has been unconfigured. Will monitor %s vrf. Use \"option vrf value <vrf_name>\" to set a new vrf to monitor" % (self.target_vrf, DEFAULT_TARGET_VRF))
+                self.target_vrf = DEFAULT_TARGET_VRF
+        elif option_name == "route":
+            if option_value:
+                self.target_route = option_value
+                self.target_route_prefix = eossdk.IpPrefix(self.target_route)
+            else:
+                self.logger(3,"CONFIG_ERROR","Monitoring for route %s has been unconfigured. Use \"option route value <subnet/mask>\" to set a new route to monitor" % self.target_route)
+                self.logger(6,"INIT","Exiting...")
+                self.agent_mgr.exit()
+
+        elif option_name == "support-bundle-format":
+            if option_value:
+                self.support_bundle_format = option_value
+            else:
+                self.support_bundle_format = DEFAULT_SUPPORT_BUNDLE_FORMAT
+        # If we've already been initialized then we need to process the config changes
+        if self.initialized:
+            self.on_config_change()
+
+
+    # This function override is called anytime a route is set
+    # it can occur both when an existing route is changed, overridden, or a brand new route is created
+    def on_route_set(self, route):
+        self.tracer.trace0("Entering on_route_set event handler")
+        # Check if route is the one we're interested in
+        if route.route_key().prefix() == self.target_route_prefix:
+            # Get route destination
+            route_via = self.get_route_via(route)
+            # Create an object that contains the current route state
+            current_route_state = RouteState(route.preference(), route.metric(), route.route_type(), route_via)
+            # Pass current state to state change handler
+            self.on_state_change(current_route_state)
+
+    # This function override is called anytime a route is removed
+    # it only occurs when there is no route left for the prefix, NOT when it's replaced
+    def on_route_del(self, route_key):
+        self.tracer.trace0("Entering on_route_del event handler")
+        if route_key.prefix() == self.target_route_prefix:
+            # Get current route state
+            # this is probably unnecessary, in all my testing on_route_del is only called
+            # when there is no existing route left for the prefix
+            # but in effort to be cautious we are going to poll the current state for the prefix
+            current_route_state = self.get_current_route_state()
+            # Pass current state to state change handler
+            self.on_state_change(current_route_state)
+
+    # For a given route find the next-hop/via address
+    # the eossdk objects we were getting were losing their values when
+    # passed directly as a return value of this function
+    def get_route_via(self, route):
+        fec_id = route.fec_id()
+        fec = self.fib_mgr.fib_fec( eossdk.FibFecKey(fec_id) )
+        route_via = fec.via()
+        response_list = []
+        for via in route_via:
+            response_list.append({
+                    'hop': via.hop(),
+                    'intf': via.intf()
+                })
+        return(response_list)
+
+    # Get the current state of the route
+    # as with other functions I don't know how to preserve the eossdk datatypes when passing
+    # them as a return value, so I created an entire object RouteState to reflect the data into
+    # and return that instead.
+    # If no route is found we just return the string "NOROUTE"
+    def get_current_route_state(self):
+        found = False
+        for route in self.fib_mgr.fib_route_iter():
+            if route.route_key().prefix() == self.target_route_prefix:
+                route_via = self.get_route_via(route)
+                found = True
+        if found == False:
+            return "NOROUTE"
+        return RouteState(route.preference(), route.metric(), route.route_type(), route_via)
+
+    # Return json output of the desired support bundle commands
+    def get_support_bundle_state(self):
+        support_bundle_current_state = dict()
+        for cmd in self.support_bundle_cmds:
+            _cmd = cmd.format(target_route = self.target_route, target_vrf = self.target_vrf)
+            response = self.eapi_client.runCmds(1,["enable",_cmd],self.support_bundle_format)['result'][1]
+            if self.support_bundle_format == "text":
+                support_bundle_current_state[_cmd] = response['output']
+            else:
+                support_bundle_current_state[_cmd] = response
+        return support_bundle_current_state
+
+    # Handler for state changes to our target route
+    # this can be customized to do any actions desired with the state info
+    # currently we just write some syslog messages and then create a support bundle text file
+    # on the device
+    def on_state_change(self, current_route_state):
+        if current_route_state == "NOROUTE":
+            self.logger(2,"ROUTE_LOST","Lost all routes to %s" % self.target_route)
+        else:
+            self.logger(3,"ROUTE_CHANGED","Route state for %s changed" % self.target_route)
+        support_bundle_file_name = "%s-%s-RouteMon-%s-show-output.txt" % (self.hostname, time(), self.agent_name)
+        support_bundle_output = dict()
+        support_bundle_output['CURRENT_STATE'] = self.get_support_bundle_state()
+        support_bundle_output['PREVIOUS_STATE'] = self.support_bundle_last_known_state
+        support_bundle_file = open("%s%s" % (SUPPORT_BUNDLE_FILE_PATH, support_bundle_file_name), "w")
+        if self.support_bundle_format == 'text':
+            for state in support_bundle_output:
+                support_bundle_file.write("################ {state} ################\n".format(state=state))
+                for cmd in support_bundle_output[state]:
+                    support_bundle_file.write("{hostname}#{cmd}\n{cmd_output}\n{hostname}#\n".format(hostname=self.hostname,
+                                                                                                     cmd=cmd,
+                                                                                                     cmd_output=support_bundle_output[state][cmd]))
+                support_bundle_file.write("###############################################\n\n")
+        else:
+            support_bundle_file.write(json.dumps(support_bundle_output, indent=4))
+        support_bundle_file.close()
+        self.logger(3,"SUPPORT_BUNDLE","Support bundle saved flash:%s" % support_bundle_file_name)
+        self.logger(4,"SUPPORT_BUNDLE","View support bundle with: more flash:%s" % support_bundle_file_name)
+        self.support_bundle_last_known_state = support_bundle_output['CURRENT_STATE']
+
+
+
+if __name__ == "__main__":
+    # Get sdk objects
+    sdk_ = eossdk.Sdk()
+
+    # Create RouteMonAgent
+    _ = RouteMonAgent(sdk_)
+
+    # Begin main sdk loop
+    sdk_.main_loop(sys.argv)
